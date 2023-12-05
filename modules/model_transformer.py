@@ -14,6 +14,8 @@ from torchvision import transforms
 from scipy.spatial import ConvexHull
 
 from torchvision import transforms
+import torchvision
+import cv2
 data_transforms = transforms.Compose([
                                     transforms.Resize(size=(224, 224)),
                                     transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -27,6 +29,10 @@ data_transforms_clip = transforms.Compose([
 
 from modules.bilinear import crop_bbox_batch
 from modules.syncnet import SyncNet_color as SyncNet
+from modules.AU_detector import AUModel
+from modules.layers.residual import DownRes2dBlock
+from PIL import Image
+
 
 class Vgg19(torch.nn.Module):
     """
@@ -271,6 +277,9 @@ def set_bn_eval(m):
     # if m.find('decoder.G_middle') != -1 or m.find('decoder.up') != -1:
     #     m.eval()
 
+def mydownres2Dblock(indim,outdim,k_size = 3,padding = 1, normalize = "batch",nonlinearity = "leakyrelu",order = "NACNAC"):
+    return DownRes2dBlock(indim,outdim,k_size,padding=padding,activation_norm_type=normalize,nonlinearity=nonlinearity,inplace_nonlinearity=True,order = order)
+
 
 class GeneratorFullModelBatchDeepPromptSTEAM3D(torch.nn.Module):
     """
@@ -291,7 +300,7 @@ class GeneratorFullModelBatchDeepPromptSTEAM3D(torch.nn.Module):
         # self.generator.decoder.eval()
         # self.generator.dense_motion_network.eval()
         # self.generator.eval()
-        self.audio2kptransformer.apply(set_bn_eval)
+        self.audio2kptransformer.apply(set_bn_eval)         # TODO add AU model, AU model need apply set_bn_eval
         # self.discriminator = discriminator
         # self.discriminator.eval()
         self.train_params = train_params
@@ -347,6 +356,26 @@ class GeneratorFullModelBatchDeepPromptSTEAM3D(torch.nn.Module):
                 self.syncnet = self.syncnet.cuda()
                 self.syncnet.eval()
             self.logloss = nn.BCELoss()
+        
+        if self.loss_weights['au'] != 0:
+            self.au_model = AUModel()
+            self.au_model.init_parameters("ckpt/au_resnet18.pth")
+            for p in self.au_model.parameters():
+                p.requires_grad = False
+            if torch.cuda.is_available():
+                self.au_model = self.au_model.cuda()
+                self.au_model.eval()                
+            self.auloss = nn.SmoothL1Loss()
+            # AU FC layer from emotion
+            self.au_fc = nn.Linear(173, 24).cuda()
+            norm = 'batch'
+            self.decode_dim = 32
+            self.decodefeature_extract = nn.Sequential(mydownres2Dblock(self.decode_dim,32, normalize = norm),
+                                mydownres2Dblock(32,48, normalize = norm),
+                                mydownres2Dblock(48,64, normalize = norm),
+                                mydownres2Dblock(64,96, normalize = norm),
+                                mydownres2Dblock(96,128, normalize = norm),
+                                nn.AvgPool2d(2)).cuda()
 
         if self.loss_weights['clip'] != 0:
             self.clip_model, self.clip_preprocess = clip.load("ViT-L/14")
@@ -401,6 +430,7 @@ class GeneratorFullModelBatchDeepPromptSTEAM3D(torch.nn.Module):
         # print(emoprompt.shape)
         ### a2kp
         he_driving_emo, input_st = self.audio2kptransformer(x, kp_canonical, emoprompt=emoprompt, deepprompt=deepprompt, side=True)           # {'yaw': yaw, 'pitch': pitch, 'roll': roll, 't': t, 'exp': exp}
+        #input_st['face_feature_map'].shape = ([1,32,64,64])
         emo_exp = self.sidetuning(input_st, emoprompt, deepprompt)
         he_driving = x['he_driving']
         exp = he_driving_emo['emo']
@@ -416,6 +446,11 @@ class GeneratorFullModelBatchDeepPromptSTEAM3D(torch.nn.Module):
         ### add emotional expression
         emo_exp = emo_exp.reshape(bbs, bs, 45)
         exp = exp+emo_exp
+        exp_au = exp # (1,5,45)
+        # TODO cat face feature as AU FC input
+        # face feature shape () extend to (1,5,c,h,w)
+        # face feature  (1,5,128,7,7)
+        # face feature  (1,5,128)
 
         source_areas = []
         kp_driving = []
@@ -579,6 +614,37 @@ class GeneratorFullModelBatchDeepPromptSTEAM3D(torch.nn.Module):
                 #     ### detect failed
                 #     loss_values['img_l1'] = torch.abs(x['driving']-generated['prediction']).mean()
                 #     loss_values['sync'] = torch.FloatTensor([0]).to(device).mean()
+            if self.loss_weights['au'] != 0:
+                                
+                img_au = generated['prediction']
+
+                # img_au_numpy = img_au.data.cpu().numpy().transpose([0, 2, 3, 1])[0] * 255
+                # img_au_numpy = img_au_numpy.astype(np.uint8)
+                # cv2.imwrite('result.jpg', img_au_numpy)
+
+
+                img_au = F.interpolate(img_au, size=(224,224), mode='bilinear', align_corners=False)
+                #这里应该调用一个mmdetector的函数，输入是一个batch的图片，输出是一个batch的bbox，然后送给AU model                
+                # for i in range(bbs):
+                #     img_au[i] = torch.ones(3, 256, 256).to(device) * i/bbs
+                # torchvision.utils.save_image(generated['prediction'], 'img_au.jpg', nrow=bbs, normalize=True, range=(0, 1))
+                # torchvision.utils.save_image(img_au, 'img_au_torchvision.jpg', nrow=1, normalize=True)
+
+                # TODO check 数据处理是否正确
+
+                au_detect = self.au_model(img_au)
+                
+                face_feature = input_st['face_feature_map']
+                face_feature = self.decodefeature_extract(face_feature).reshape(bbs, 1, -1).repeat(1, bs,1).reshape(bbs*bs, 1, -1)
+                face_feature = face_feature.permute(1, 0, 2).contiguous().view(1, -1, 128)
+
+                au_feature = torch.cat([exp_au, face_feature], dim=2)
+                # exp_au = exp_au.squeeze(1) 
+                au_pred = self.au_fc(au_feature)
+                value = self.auloss(au_detect, au_pred)
+                loss_values['au'] = self.loss_weights['au'] * value
+
+
 
         if self.loss_weights['latent'] != 0:
             loss_values['latent_emo'] = self.loss_weights['latent'] * F.mse_loss(he_new_driving['exp'], he_driving['exp'].squeeze(0))
